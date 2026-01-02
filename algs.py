@@ -1,5 +1,12 @@
 import numpy as np
 from numpy.linalg import svd
+from collections import defaultdict
+
+import numpy as np
+from collections import defaultdict
+from numpy.linalg import multi_dot
+from scipy.linalg import svd, qr, norm
+from math import sqrt
 
 
 class CBSCFD:
@@ -89,66 +96,6 @@ class CBSCFD:
             var = np.dot(x, self._apply_V_inv(x, a))
             scores.append(mean + self.beta * np.sqrt(max(var, 0)))
         return int(np.argmax(scores))
-
-
-from collections import defaultdict
-class LinUCB:
-    def __init__(self, num_arms, d, alpha, epsilon=1.0):
-        self.num_arms = num_arms
-        self.d = d
-
-        self.alpha = alpha
-        self.epsilon = epsilon
-
-
-        self.D = defaultdict(list)
-        self.b = defaultdict(list)
-
-        self.A = defaultdict(lambda: self.epsilon * np.eye(self.d))
-        self.A_inv = defaultdict(lambda: np.eye(self.d) / self.epsilon)
-        self.rhs = defaultdict(lambda: np.zeros(self.d))
-        self.theta = defaultdict(lambda: np.zeros(self.d, dtype=np.float32))
-
-
-
-    def append_interaction(self, user_context, a, r):
-        x_ua = user_context
-        self.D[a].append(x_ua)
-        self.b[a].append(r)
-
-    def batch_update(self, arms=None):
-        if arms is None:
-
-            arms = self.D.keys()
-
-        for a in arms:
-            if len(self.D[a]) == 0:
-                continue
-
-            D_a = np.vstack(self.D[a])
-            b_a = np.array(self.b[a])
-
-            self.A[a] += D_a.T @ D_a
-            self.A_inv[a] = np.linalg.inv(self.A[a])
-            self.rhs[a] += D_a.T @ b_a
-
-            self.theta[a] = self.A_inv[a] @ self.rhs[a]
-
-
-        self.D.clear()
-        self.b.clear()
-
-    def score(self, user_context, arm):
-        ctx = user_context
-        mean = float(np.dot(self.theta[arm].T, ctx))
-        exp = self.alpha * np.sqrt(np.dot(ctx.T, self.A_inv[arm] @ ctx))
-        return mean + exp
-
-import numpy as np
-from collections import defaultdict
-from numpy.linalg import multi_dot
-from scipy.linalg import svd, qr, norm
-from math import sqrt
 
 def integrator(tilde_Ut, S, tilde_Vt, delta_U, delta_V):
     #print("Integrator called")
@@ -259,9 +206,6 @@ class LinUCBwithPSI_rank1:
         self.theta[arm] = term1 - term2 - term3 + term4
 
     def score(self, user_context, arm):
-        """
-        Compute the PSI-UCB score for a given user context and arm.
-        """
         ctx = user_context
         mean = float(np.dot(self.theta[arm].T, ctx))
         v = self.V[arm].T @ ctx
@@ -271,3 +215,313 @@ class LinUCBwithPSI_rank1:
         )
         return mean + self.alpha * exp
 
+
+# def integrator(U0, S0, V0, U, V):
+#     K1 = U0 @ S0 + multi_dot([U, V.T, V0])
+#     U1, S1_bar = np.linalg.qr(K1)
+#     S0_tilde = S1_bar - multi_dot([U1.T, U, V.T, V0])
+#     # S0_tilde = S1_bar - U1.T @ (U @ V.T  - U0 @ S0 @ V0.T) @ V0
+#     # L1 = V0 @ S0_tilde.T + (U1 @ V1.T  - U0 @ S0 @ V0.T).T @ U1
+#     L1 = V0 @ S0_tilde.T + multi_dot([V, U.T, U1])
+#     V1, S1_T = np.linalg.qr(L1)
+#     S1 = S1_T.T
+#
+#     return U1, S1, V1
+
+
+def getStartingValues(u, v, k):
+    Qu, Ru = np.linalg.qr(u)
+    Qv, Rv = np.linalg.qr(v)
+
+
+    small_matrix = Ru @ Rv.T
+
+    try:
+        U_s, S, Vh_s = np.linalg.svd(small_matrix, full_matrices=False)
+    except np.linalg.LinAlgError:
+
+        print('reg')
+        reg = 1e-10 * np.eye(small_matrix.shape[0])
+        small_matrix_reg = small_matrix + reg
+        U_s, S, Vh_s = np.linalg.svd(small_matrix_reg, full_matrices=False)
+
+    U_s = U_s[:, :k]
+    S = S[:k]
+    S = np.diag(S)
+    Vh_s = Vh_s[:k, :]
+
+    U = Qu @ U_s
+    V = Qv @ Vh_s.T
+    #print(U.shape)
+    #print( U, S, V)
+
+    return U, S, V
+
+
+
+
+def symmetric_factorization_ambikassaran_qr(X_bar):
+    d, B = X_bar.shape  # x_bar
+
+    # print(X_Bar.shape)
+    Q, R = np.linalg.qr(X_bar)
+    # print(R.shape)
+
+    T = np.eye(B) + R @ R.T
+    M = np.linalg.cholesky(T)
+
+    Y_tB = (M - np.eye(B))
+    return Y_tB, Q
+
+class LinUCBwithPSI_Batch:
+    def __init__(self, num_arms, user_features, item_features, epsilon=1.0,
+                 alpha=1, rank=10):
+
+        self.user_features = user_features
+        self.item_features = item_features
+
+        self.d_u = user_features.shape[1]
+        self.d_i = item_features.shape[1]
+        self.d = self.d_u * self.d_i
+
+        self.num_arms = num_arms
+        self.epsilon = epsilon
+        self.alpha = alpha
+        self.rank = rank
+        # self.gamma = gamma
+
+        self.eps = 1 / np.sqrt(epsilon)
+
+        self.U = defaultdict(lambda: np.empty((self.d, 0), dtype=np.float32))
+        self.V = defaultdict(lambda: np.empty((self.d, 0), dtype=np.float32))
+        self.U_psi = defaultdict(lambda: None)
+        self.V_psi = defaultdict(lambda: None)
+        self.S_psi = defaultdict(lambda: None)
+        self.b = defaultdict(lambda: np.zeros(self.d, dtype=np.float32))
+        self.theta = defaultdict(lambda: np.zeros(self.d, dtype=np.float32))
+
+    def _concat_features(self, user_context, arm):
+        x_u = user_context
+        x_a = self.item_features[arm]
+        return np.outer(x_u, x_a).flatten()
+
+    def batch_update(self, arm, X_batch, rewards):
+        self.b[arm] += X_batch @ rewards
+
+        X_bar = (X_batch -
+                 multi_dot([self.U[arm], self.V[arm].T, X_batch])) * self.eps
+
+        try:
+            Y_tB, Q = symmetric_factorization_ambikassaran_qr(X_bar)
+            Y_tB_inv = np.linalg.inv(Y_tB + 1e-10 * np.eye(X_bar.shape[1]))
+            C = np.linalg.inv(Y_tB_inv + np.eye(Y_tB.shape[0]))
+
+        except np.linalg.LinAlgError as e:
+            print(f"Linear algebra error for arm {arm}: {e}")
+            return False
+
+        self.U[arm], self.V[arm] = self._apply_psi_batch(arm, Q, C)
+
+        # L0_inv_b = self.eps * self.b[arm]
+        # V_T_L0_inv = self.V[arm].T * self.eps
+
+        # self.theta[arm] = self.eps * (L0_inv_b
+        #                   - multi_dot([self.U[arm], V_T_L0_inv, self.b[arm]])
+        #                   - multi_dot([self.V[arm], self.U[arm].T, L0_inv_b])
+        #                   + multi_dot([self.V[arm], self.U[arm].T, self.U[arm], V_T_L0_inv, self.b[arm]]))
+        eps = self.eps ** 2 * self.b[arm]
+
+        term1 = eps
+        term2 = multi_dot([self.U[arm], self.V[arm].T, eps])
+        term3 = multi_dot([self.V[arm], self.U[arm].T, eps])
+        term4 = multi_dot([self.V[arm], self.U[arm].T, self.U[arm], self.V[arm].T, eps])
+
+        self.theta[arm] = term1 - term2 - term3 + term4
+
+        return True
+
+    def train_from_prepared_batches(self, prepared_batches):
+
+        print(f"Training on {len(prepared_batches)} arms")
+
+        for arm in tqdm(prepared_batches.keys(), desc="Training"):
+            arm_batches = prepared_batches[arm]
+
+            for X_batch, rewards in arm_batches:
+                self.batch_update(arm, X_batch, rewards)
+
+        print('Training completed')
+
+    def train(self, data_by_arm, batch_size):
+
+        prepared_batches = prepare_feature_matrices(data_by_arm, self.item_features, batch_size)
+
+        self.train_from_prepared_batches(prepared_batches)
+
+    def _update_u_and_v(self, arm, Q, C):
+        U_update = Q @ C
+
+        if self.V[arm].size > 0:
+            V_update = Q - multi_dot([self.V[arm], self.U[arm].T, Q])
+        else:
+            V_update = Q
+
+        return U_update, V_update
+
+    def _apply_psi_batch(self, arm, Q, C):
+        current_cols = self.U[arm].shape[1]
+        U_update, V_update = self._update_u_and_v(arm, Q, C)
+
+        if current_cols < self.rank:
+            self.U[arm] = np.column_stack([self.U[arm], U_update]) if current_cols > 0 else U_update
+            self.V[arm] = np.column_stack([self.V[arm], V_update]) if current_cols > 0 else V_update
+            return self.U[arm], self.V[arm]
+
+        elif self.U_psi[arm] is None:
+            U0, S0, V0 = getStartingValues(self.U[arm], self.V[arm], self.rank)
+            self.U_psi[arm] = U0
+            self.S_psi[arm] = S0
+            self.V_psi[arm] = V0
+
+        self.U_psi[arm], self.S_psi[arm], self.V_psi[arm] = integrator(
+            self.U_psi[arm], self.S_psi[arm], self.V_psi[arm],
+            U_update, V_update)
+
+        return self.U_psi[arm] @ self.S_psi[arm], self.V_psi[arm]
+
+    def predict_top_n(self, user_context, candidate_items, n=10):
+        ucb_scores = []
+
+        for arm in candidate_items:
+            context = self._concat_features(user_context, arm)
+            mean_reward = np.dot(self.theta[arm].T, context)
+            v = np.dot(self.V[arm].T, context)
+            exploration = self.alpha * self.eps * np.linalg.norm(context - self.U[arm].dot(v))
+
+            ucb_scores.append(mean_reward + exploration)
+
+        ucb_scores = np.array(ucb_scores)
+        top_indices = np.argsort(ucb_scores)[::-1][:n]
+
+        return [candidate_items[i] for i in top_indices]
+
+
+class LinUCB_SM:
+    def __init__(self, num_arms,d, alpha, epsilon=1.0):
+        self.num_arms = num_arms
+        self.d = d
+
+        self.alpha = alpha
+        self.epsilon = epsilon
+
+        # Initialize A_a and b_a for each arm according to the algorithm
+        self.A = defaultdict(lambda: self.epsilon * np.eye(self.d))
+        self.A_inv = defaultdict(lambda: np.eye(self.d) / self.epsilon)
+        self.b = defaultdict(lambda: np.zeros(self.d))
+        self.theta = defaultdict(lambda: np.zeros(self.d, dtype=np.float32))
+
+        self.update_count = 0
+
+
+    def update(self, user_context, a, r):
+        x_ua = user_context
+
+        # self.A[a] += np.outer(x_ua, x_ua)
+
+        self.b[a] += r * x_ua
+
+        # self.A_inv[a] = np.linalg.inv(self.A[a])
+        # self.A_inv[a] = self.A_inv[a] - (self.A_inv[a]@x_ua @(x_ua.T@self.A_inv[a]))/(1+x_ua.T@self.A_inv[a]@x_ua)
+        A_inv_x = self.A_inv[a] @ x_ua
+        self.A_inv[a] -= np.outer(A_inv_x, A_inv_x) / (1 + x_ua.T @ A_inv_x)
+
+        self.theta[a] = self.A_inv[a] @ self.b[a]
+
+        self.update_count += 1
+
+
+    def score(self, user_context, arm):
+        ctx = user_context
+        mean = float(np.dot(self.theta[arm].T, ctx))
+        exp = self.alpha * np.sqrt(np.dot(ctx.T, self.A_inv[arm] @ ctx))
+        return mean + exp
+
+class LinUCB:
+    def __init__(self, num_arms, d, alpha, epsilon=1.0):
+        self.num_arms = num_arms
+        self.d = d
+
+        self.alpha = alpha
+        self.epsilon = epsilon
+
+
+        self.D = defaultdict(list)
+        self.b = defaultdict(list)
+
+        self.A = defaultdict(lambda: self.epsilon * np.eye(self.d))
+        self.A_inv = defaultdict(lambda: np.eye(self.d) / self.epsilon)
+        self.rhs = defaultdict(lambda: np.zeros(self.d))
+        self.theta = defaultdict(lambda: np.zeros(self.d, dtype=np.float32))
+
+    def append_interaction(self, user_context, a, r):
+        x_ua = user_context
+        self.D[a].append(x_ua)
+        self.b[a].append(r)
+
+    def batch_update(self, arms=None):
+        if arms is None:
+
+            arms = self.D.keys()
+
+        for a in arms:
+            if len(self.D[a]) == 0:
+                continue
+
+            D_a = np.vstack(self.D[a])
+            b_a = np.array(self.b[a])
+
+            self.A[a] += D_a.T @ D_a
+            self.A_inv[a] = np.linalg.inv(self.A[a])
+            self.rhs[a] += D_a.T @ b_a
+
+            self.theta[a] = self.A_inv[a] @ self.rhs[a]
+
+
+        self.D.clear()
+        self.b.clear()
+
+    def score(self, user_context, arm):
+        ctx = user_context
+        mean = float(np.dot(self.theta[arm].T, ctx))
+        exp = self.alpha * np.sqrt(np.dot(ctx.T, self.A_inv[arm] @ ctx))
+        return mean + exp
+
+
+class CBRAP:
+    def __init__(self, num_arms, d, lambd=1.0, beta=1.0, m=50):
+        self.num_arms = num_arms
+        self.d = d
+        self.m = m
+        self.alpha = lambd
+        self.beta = beta
+
+        self.M = np.random.randn(m, d) / np.sqrt(m)
+        self.A = defaultdict(lambda: self.alpha * np.eye(self.m))
+        self.b = defaultdict(lambda: np.zeros(self.m))
+        self.theta_z = defaultdict(lambda: np.zeros(self.m))
+
+    def _project(self, x):
+        return self.M @ x
+
+    def update(self, x, a, r):
+        z = self._project(x)
+        self.A[a] += np.outer(z, z)
+        self.b[a] += r * z
+        self.theta_z[a] = np.linalg.solve(self.A[a], self.b[a])
+
+    def score(self, x, a):
+        z = self._project(x)
+        mean = np.dot(z, self.theta_z[a])
+        A_inv = np.linalg.inv(self.A[a])
+        exp = self.beta * np.sqrt(z @ A_inv @ z)
+        return mean + exp

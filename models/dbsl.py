@@ -32,13 +32,14 @@ class DBSL:
 
         self.deltas = np.array([self.lmd])
 
-    @profile
+    #@profile
     def fit(
         self, decision_set: npt.NDArray, observe: Callable[[int, npt.ArrayLike], float]
     ) -> float:
         """
         decision_set: (num_actions, d)
         """
+        S, H = self.sketch.get()
         self.time += 1
 
         if decision_set.ndim != 2:
@@ -99,7 +100,7 @@ def demo_call_fit_dbsl():
     # (num_actions, d)
     decision_set = np.random.randn(num_actions, d)
 
-    # простая игрушечная награда: линейная + шум
+
     true_theta = np.random.randn(d)
 
     def observe(ind, x):
@@ -108,6 +109,6 @@ def demo_call_fit_dbsl():
     r = model.fit(decision_set, observe)
     print("reward:", r)
 
-# запуск
+
 if __name__ == "__main__":
     demo_call_fit_dbsl()
