@@ -1,3 +1,7 @@
+import numpy as np
+from numpy.linalg import svd
+
+
 class CBSCFD:
     def __init__(self, num_arms, lambd, beta, m, d):
         self.num_arms = num_arms
@@ -85,3 +89,185 @@ class CBSCFD:
             var = np.dot(x, self._apply_V_inv(x, a))
             scores.append(mean + self.beta * np.sqrt(max(var, 0)))
         return int(np.argmax(scores))
+
+
+from collections import defaultdict
+class LinUCB:
+    def __init__(self, num_arms, d, alpha, epsilon=1.0):
+        self.num_arms = num_arms
+        self.d = d
+
+        self.alpha = alpha
+        self.epsilon = epsilon
+
+
+        self.D = defaultdict(list)
+        self.b = defaultdict(list)
+
+        self.A = defaultdict(lambda: self.epsilon * np.eye(self.d))
+        self.A_inv = defaultdict(lambda: np.eye(self.d) / self.epsilon)
+        self.rhs = defaultdict(lambda: np.zeros(self.d))
+        self.theta = defaultdict(lambda: np.zeros(self.d, dtype=np.float32))
+
+
+
+    def append_interaction(self, user_context, a, r):
+        x_ua = user_context
+        self.D[a].append(x_ua)
+        self.b[a].append(r)
+
+    def batch_update(self, arms=None):
+        if arms is None:
+
+            arms = self.D.keys()
+
+        for a in arms:
+            if len(self.D[a]) == 0:
+                continue
+
+            D_a = np.vstack(self.D[a])
+            b_a = np.array(self.b[a])
+
+            self.A[a] += D_a.T @ D_a
+            self.A_inv[a] = np.linalg.inv(self.A[a])
+            self.rhs[a] += D_a.T @ b_a
+
+            self.theta[a] = self.A_inv[a] @ self.rhs[a]
+
+
+        self.D.clear()
+        self.b.clear()
+
+    def score(self, user_context, arm):
+        ctx = user_context
+        mean = float(np.dot(self.theta[arm].T, ctx))
+        exp = self.alpha * np.sqrt(np.dot(ctx.T, self.A_inv[arm] @ ctx))
+        return mean + exp
+
+import numpy as np
+from collections import defaultdict
+from numpy.linalg import multi_dot
+from scipy.linalg import svd, qr, norm
+from math import sqrt
+
+def integrator(tilde_Ut, S, tilde_Vt, delta_U, delta_V):
+    #print("Integrator called")
+    Ut = tilde_Ut.copy()
+    Vt = tilde_Vt.copy()
+    K1 = Ut @ S + delta_U.dot(delta_V.T.dot(Vt))
+    tilde_U1, tilde_S1 = qr(K1,mode = "economic")
+    tilde_S0 = tilde_S1 - tilde_U1.T.dot(delta_U.dot(delta_V.T.dot(Vt)))
+    L1 = Vt.dot(tilde_S0.T) + delta_V.dot(delta_U.T.dot(tilde_U1))
+    tilde_V1, S1 = qr(L1, mode = "economic")
+    S1 = S1.T
+    return tilde_U1, S1, tilde_V1
+
+def svd_U_V_T(U, V, rank):
+    Q_U, R_U = qr(U, mode = "economic")
+    Q_V, R_V = qr(V, mode = "economic")
+
+    U_svd, S_svd, V_svd = svd(R_U.dot(R_V.T), full_matrices = False)
+
+    U_svd = U_svd[:, :rank]
+    S_svd = S_svd[:rank]
+    V_svd = V_svd[:rank, :]
+
+    U_new = Q_U.dot(U_svd)
+    V_new = V_svd.dot(Q_V.T)
+
+    return U_new, np.diag(S_svd), V_new.T
+
+
+
+class LinUCBwithPSI_rank1:
+    def __init__(self, n_arms, d = 10, epsilon = 1.0, alpha = 1.0, rank = 10):
+        self.n_arms = n_arms # количество ручек
+        self.d = d # размерность контекстных векторов
+        self.epsilon = epsilon # регуляризация
+        self.sqrt_epsilon = 1 / sqrt(epsilon) # коэффициент для L_0^{-1}
+
+        self.alpha = alpha # эскплорейшен
+        self.rank = rank # малоранговое приближение
+
+        self.U = defaultdict(lambda: np.empty((self.d, 0), dtype=np.float32))
+        self.V = defaultdict(lambda: np.empty((self.d, 0), dtype=np.float32))
+
+        self.first_time = defaultdict(lambda: False)
+        #для  интегратора храним факторы с предыдущего шага
+        self.Ut = defaultdict(lambda: None)
+        self.St = defaultdict(lambda: None)
+        self.Vt = defaultdict(lambda: None)
+
+        self.b = defaultdict(lambda: np.zeros(self.d, dtype=np.float32)) # вектор наград
+        self.theta = defaultdict(lambda: np.zeros(self.d, dtype=np.float32)) # оценка параметра
+
+    def _L_matvec(self, vec, arm):
+
+        L_0_inv_vec = self.sqrt_epsilon * vec.copy()
+        return L_0_inv_vec - self.U[arm].dot(self.V[arm].T.dot(L_0_inv_vec))
+
+    def update(self, user_context, arm, reward):
+
+        self.b[arm] += reward * user_context
+
+        bar_x = self._L_matvec(vec = user_context, arm = arm)
+
+        norm_bar_x_sq = norm(bar_x) ** 2
+        alpha_t = (sqrt(1 + norm_bar_x_sq) - 1) / norm_bar_x_sq
+        beta_t = alpha_t / (1 + alpha_t * norm_bar_x_sq)
+
+        self.U[arm], self.V[arm] = self._update_factors(bar_x=bar_x, beta_t=beta_t, arm=arm)
+
+        self._update_theta(arm)
+
+    def _update_u_and_v(self, x_bar, beta_t, arm):
+        delta_u = beta_t * x_bar
+
+        if self.V[arm].shape[1] > 0:
+            delta_v = x_bar - self.V[arm] @ (self.U[arm].T @ x_bar)
+        else:
+            delta_v = x_bar
+
+        return delta_u.reshape(-1, 1), delta_v.reshape(-1, 1)
+
+    def _update_factors(self, bar_x, beta_t, arm):
+        delta_U, delta_V = self._update_u_and_v(bar_x, beta_t, arm)
+        if self.U[arm].shape[1] == 0:
+            self.U[arm] = delta_U
+            self.V[arm] = delta_V
+            return self.U[arm], self.V[arm]
+        elif self.U[arm].shape[1] < self.rank:
+            self.U[arm] = np.column_stack([self.U[arm], delta_U])
+            self.V[arm] = np.column_stack([self.V[arm], delta_V])
+            return self.U[arm], self.V[arm]
+
+        if self.Ut[arm] is None:
+            self.Ut[arm], self.St[arm], self.Vt[arm] = svd_U_V_T(self.U[arm], self.V[arm], self.rank)
+            #self.first_time[arm] = True
+        self.Ut[arm], self.St[arm],  self.Vt[arm] = integrator(self.Ut[arm], self.St[arm], self.Vt[arm], delta_U, delta_V)
+
+        return self.Ut[arm] @ self.St[arm],  self.Vt[arm]
+
+    def _update_theta(self, arm):
+        b_eps = self.epsilon * self.b[arm]
+
+        term1 = b_eps
+        term2 = self.V[arm].dot(self.U[arm].T.dot(b_eps))
+        term3 = self.U[arm].dot(self.V[arm].T.dot(b_eps))
+        term4 = self.V[arm].dot(self.U[arm].T.dot(term3))
+
+        self.theta[arm] = term1 - term2 - term3 + term4
+
+    def score(self, user_context, arm):
+        """
+        Compute the PSI-UCB score for a given user context and arm.
+        """
+        ctx = user_context
+        mean = float(np.dot(self.theta[arm].T, ctx))
+        v = self.V[arm].T @ ctx
+        exp = (
+            self.sqrt_epsilon
+            * np.linalg.norm(ctx - (self.U[arm] @ v))
+        )
+        return mean + self.alpha * exp
+
