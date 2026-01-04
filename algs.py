@@ -86,6 +86,7 @@ class CBSCFD:
         x = user_context
         mean = np.dot(self.theta[arm], x)
         var = np.dot(x, self._apply_V_inv(x, arm))
+        #print(mean, var)
         return mean + self.beta * np.sqrt(max(var, 0))
 
     def select_arm(self, contexts):
@@ -127,8 +128,8 @@ def svd_U_V_T(U, V, rank):
 
 
 class LinUCBwithPSI_rank1:
-    def __init__(self, n_arms, d = 10, epsilon = 1.0, alpha = 1.0, rank = 10):
-        self.n_arms = n_arms # количество ручек
+    def __init__(self, num_arms, d = 10, epsilon = 1.0, alpha = 1.0, rank = 10):
+        self.n_arms = num_arms # количество ручек
         self.d = d # размерность контекстных векторов
         self.epsilon = epsilon # регуляризация
         self.sqrt_epsilon = 1 / sqrt(epsilon) # коэффициент для L_0^{-1}
@@ -213,6 +214,7 @@ class LinUCBwithPSI_rank1:
             self.sqrt_epsilon
             * np.linalg.norm(ctx - (self.U[arm] @ v))
         )
+        #print(mean, exp)
         return mean + self.alpha * exp
 
 
@@ -274,15 +276,10 @@ def symmetric_factorization_ambikassaran_qr(X_bar):
     return Y_tB, Q
 
 class LinUCBwithPSI_Batch:
-    def __init__(self, num_arms, user_features, item_features, epsilon=1.0,
+    def __init__(self, num_arms, d, epsilon=1.0,
                  alpha=1, rank=10):
 
-        self.user_features = user_features
-        self.item_features = item_features
-
-        self.d_u = user_features.shape[1]
-        self.d_i = item_features.shape[1]
-        self.d = self.d_u * self.d_i
+        self.d = d
 
         self.num_arms = num_arms
         self.epsilon = epsilon
@@ -300,12 +297,8 @@ class LinUCBwithPSI_Batch:
         self.b = defaultdict(lambda: np.zeros(self.d, dtype=np.float32))
         self.theta = defaultdict(lambda: np.zeros(self.d, dtype=np.float32))
 
-    def _concat_features(self, user_context, arm):
-        x_u = user_context
-        x_a = self.item_features[arm]
-        return np.outer(x_u, x_a).flatten()
 
-    def batch_update(self, arm, X_batch, rewards):
+    def update(self, X_batch, arm, rewards):
         self.b[arm] += X_batch @ rewards
 
         X_bar = (X_batch -
@@ -340,23 +333,23 @@ class LinUCBwithPSI_Batch:
 
         return True
 
-    def train_from_prepared_batches(self, prepared_batches):
+    # def train_from_prepared_batches(self, prepared_batches):
+    #
+    #     print(f"Training on {len(prepared_batches)} arms")
+    #
+    #     for arm in tqdm(prepared_batches.keys(), desc="Training"):
+    #         arm_batches = prepared_batches[arm]
+    #
+    #         for X_batch, rewards in arm_batches:
+    #             self.batch_update(arm, X_batch, rewards)
+    #
+    #     print('Training completed')
 
-        print(f"Training on {len(prepared_batches)} arms")
-
-        for arm in tqdm(prepared_batches.keys(), desc="Training"):
-            arm_batches = prepared_batches[arm]
-
-            for X_batch, rewards in arm_batches:
-                self.batch_update(arm, X_batch, rewards)
-
-        print('Training completed')
-
-    def train(self, data_by_arm, batch_size):
-
-        prepared_batches = prepare_feature_matrices(data_by_arm, self.item_features, batch_size)
-
-        self.train_from_prepared_batches(prepared_batches)
+    # def train(self, data_by_arm, batch_size):
+    #
+    #     prepared_batches = prepare_feature_matrices(data_by_arm, self.item_features, batch_size)
+    #
+    #     self.train_from_prepared_batches(prepared_batches)
 
     def _update_u_and_v(self, arm, Q, C):
         U_update = Q @ C
@@ -405,6 +398,15 @@ class LinUCBwithPSI_Batch:
 
         return [candidate_items[i] for i in top_indices]
 
+    def score(self, user_context, arm):
+        ctx = user_context
+        #mean = float(np.dot(self.theta[arm].T, ctx))
+        mean = np.dot(self.theta[arm].T, ctx)
+        v = np.dot(self.V[arm].T, ctx)
+        exp = self.alpha * self.eps * np.linalg.norm(ctx - self.U[arm].dot(v))
+        #exp = self.alpha * np.sqrt(np.dot(ctx.T, self.A_inv[arm] @ ctx))
+        return mean + exp
+
 
 class LinUCB_SM:
     def __init__(self, num_arms,d, alpha, epsilon=1.0):
@@ -443,8 +445,9 @@ class LinUCB_SM:
     def score(self, user_context, arm):
         ctx = user_context
         mean = float(np.dot(self.theta[arm].T, ctx))
-        exp = self.alpha * np.sqrt(np.dot(ctx.T, self.A_inv[arm] @ ctx))
-        return mean + exp
+        exp = np.sqrt(np.dot(ctx.T, self.A_inv[arm] @ ctx))
+        #print(mean, exp)
+        return mean + self.alpha * exp
 
 class LinUCB:
     def __init__(self, num_arms, d, alpha, epsilon=1.0):
@@ -493,8 +496,8 @@ class LinUCB:
     def score(self, user_context, arm):
         ctx = user_context
         mean = float(np.dot(self.theta[arm].T, ctx))
-        exp = self.alpha * np.sqrt(np.dot(ctx.T, self.A_inv[arm] @ ctx))
-        return mean + exp
+        exp =  np.sqrt(np.dot(ctx.T, self.A_inv[arm] @ ctx))
+        return mean + self.alpha *exp
 
 
 class CBRAP:
@@ -523,5 +526,5 @@ class CBRAP:
         z = self._project(x)
         mean = np.dot(z, self.theta_z[a])
         A_inv = np.linalg.inv(self.A[a])
-        exp = self.beta * np.sqrt(z @ A_inv @ z)
-        return mean + exp
+        exp =  np.sqrt(z @ A_inv @ z)
+        return mean + self.beta * exp

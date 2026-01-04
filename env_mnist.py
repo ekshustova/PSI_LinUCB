@@ -80,6 +80,7 @@ if __name__ == "__main__":
     T = 1000
     for _ in range(T):
         contexts = env.get_contexts()
+        print(contexts.shape)
         action = np.random.randint(10)
         env.step(action)
 
