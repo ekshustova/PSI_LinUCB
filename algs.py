@@ -528,3 +528,6 @@ class CBRAP:
         A_inv = np.linalg.inv(self.A[a])
         exp =  np.sqrt(z @ A_inv @ z)
         return mean + self.beta * exp
+
+
+
